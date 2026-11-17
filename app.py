@@ -4,8 +4,15 @@ DeepWeed AI model service.
 Implements steps 4-7 of the system flow:
   4 preprocess(image)  ->  5 predict(preprocessed)  ->  6 forwardPass()  ->  7 top3Species(conf)
 
+Two interchangeable model backends (MODEL_BACKEND):
+  keras   TensorFlow + models/weed_classifier.h5       (local development; needs ~1 GB RAM)
+  tflite  LiteRT + models/weed_classifier.tflite       (light: fits Render's free 512 MB instances)
+  auto    (default) keras if TensorFlow and the .h5 are present, otherwise tflite
+
 Run:  uvicorn app:app --host 0.0.0.0 --port 8000
 """
+import hmac
+import importlib.util
 import io
 import json
 import logging
@@ -23,44 +30,96 @@ logging.basicConfig(level=logging.INFO)
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).parent / "models"))
 MODEL_FILE = os.getenv("MODEL_FILE", "weed_classifier.h5")
+TFLITE_FILE = os.getenv("TFLITE_FILE", "weed_classifier.tflite")
 IMG_SIZE = (224, 224)  # from the model's input shape (None, 224, 224, 3)
+API_KEY = os.getenv("ML_API_KEY", "")  # when set, /predict requires header  x-api-key: <ML_API_KEY>
 
-# The saved model is a MobileNetV2 transfer-learning head with NO rescaling layer inside,
-# so inputs must be scaled the same way as during training:
-#   "rescale"   -> pixels / 255            (ImageDataGenerator(rescale=1/255), the most common setup)
-#   "mobilenet" -> pixels / 127.5 - 1      (tf.keras.applications.mobilenet_v2.preprocess_input)
-PREPROCESS = os.getenv("PREPROCESS", "rescale").lower()
+
+def _meta_preprocess():
+    try:
+        return json.loads((MODEL_DIR / "model_meta.json").read_text(encoding="utf-8")).get("preprocess")
+    except Exception:
+        return None
+
+
+# The model has NO rescaling layer inside, so inputs must be scaled like during training:
+#   "rescale"   -> pixels / 255        "mobilenet" -> pixels / 127.5 - 1
+PREPROCESS = (os.getenv("PREPROCESS") or _meta_preprocess() or "rescale").lower()
+
+
+class KerasRunner:
+    name = "keras"
+
+    def __init__(self):
+        import tensorflow as tf  # imported here so the light deployment never needs TensorFlow
+
+        path = MODEL_DIR / MODEL_FILE
+        log.info("Loading Keras model %s ...", path)
+        self.model = tf.keras.models.load_model(path, compile=False)
+        self.n_out = self.model.output_shape[-1]
+
+    def predict(self, x):
+        return self.model.predict(x, verbose=0)[0]
+
+
+class TfliteRunner:
+    name = "tflite"
+
+    def __init__(self):
+        path = MODEL_DIR / TFLITE_FILE
+        if not path.exists():
+            raise RuntimeError(
+                f"{path} not found. Run `python convert_to_tflite.py` once (see DEPLOY.md) and commit models/{TFLITE_FILE}."
+            )
+        try:
+            from ai_edge_litert.interpreter import Interpreter
+        except ImportError:  # full TensorFlow installed instead
+            import tensorflow as tf
+
+            Interpreter = tf.lite.Interpreter
+        log.info("Loading TFLite model %s ...", path)
+        self.interp = Interpreter(model_path=str(path))
+        self.interp.allocate_tensors()
+        self.inp = self.interp.get_input_details()[0]
+        self.out = self.interp.get_output_details()[0]
+        self.n_out = int(self.out["shape"][-1])
+
+    def predict(self, x):
+        self.interp.set_tensor(self.inp["index"], x.astype(self.inp["dtype"]))
+        self.interp.invoke()
+        return self.interp.get_tensor(self.out["index"])[0]
+
+
+def choose_backend() -> str:
+    b = os.getenv("MODEL_BACKEND", "auto").lower()
+    if b in ("keras", "tflite"):
+        return b
+    has_tf = importlib.util.find_spec("tensorflow") is not None
+    return "keras" if has_tf and (MODEL_DIR / MODEL_FILE).exists() else "tflite"
+
 
 state: dict = {}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    import tensorflow as tf  # imported here so --help / import checks stay fast
-
-    names = json.loads((MODEL_DIR / "class_names.json").read_text(encoding="utf-8"))
     indices = json.loads((MODEL_DIR / "class_indices.json").read_text(encoding="utf-8"))
     # class_indices.json is the authoritative index -> name mapping from training
     by_index = {v: k for k, v in indices.items()}
-    ordered = [by_index[i] for i in range(len(by_index))]
-    if ordered != names:
-        log.warning("class_names.json order differs from class_indices.json; using class_indices.json")
+    classes = [by_index[i] for i in range(len(by_index))]
 
-    log.info("Loading model %s ...", MODEL_DIR / MODEL_FILE)
-    model = tf.keras.models.load_model(MODEL_DIR / MODEL_FILE, compile=False)
-    n_out = model.output_shape[-1]
-    if n_out != len(ordered):
-        raise RuntimeError(f"Model has {n_out} outputs but {len(ordered)} class names were found")
+    runner = KerasRunner() if choose_backend() == "keras" else TfliteRunner()
+    if runner.n_out != len(classes):
+        raise RuntimeError(f"Model has {runner.n_out} outputs but {len(classes)} class names were found")
 
-    # warm-up so the first real request is fast
-    model.predict(np.zeros((1, *IMG_SIZE, 3), dtype="float32"), verbose=0)
-    state.update(model=model, classes=ordered)
-    log.info("Model ready: %d classes, preprocess=%s", n_out, PREPROCESS)
+    runner.predict(np.zeros((1, *IMG_SIZE, 3), dtype="float32"))  # warm-up: first real request is fast
+    state.update(runner=runner, classes=classes)
+    log.info("Model ready: backend=%s classes=%d preprocess=%s", runner.name, len(classes), PREPROCESS)
     yield
     state.clear()
 
 
-app = FastAPI(title="DeepWeed ML service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="DeepWeed ML service", version="1.1.0", lifespan=lifespan)
 
 
 def preprocess(raw: bytes) -> np.ndarray:
@@ -78,10 +137,10 @@ def preprocess(raw: bytes) -> np.ndarray:
 
 @app.get("/health")
 def health():
-    ready = "model" in state
+    ready = "runner" in state
     return {
         "status": "ok" if ready else "loading",
-        "model": MODEL_FILE,
+        "backend": state["runner"].name if ready else None,
         "classes": len(state.get("classes", [])),
         "preprocess": PREPROCESS,
     }
@@ -89,7 +148,9 @@ def health():
 
 @app.post("/predict")
 async def predict(request: Request):
-    if "model" not in state:
+    if API_KEY and not hmac.compare_digest(request.headers.get("x-api-key", ""), API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if "runner" not in state:
         raise HTTPException(status_code=503, detail="Model is still loading")
     raw = await request.body()
     if not raw:
@@ -97,11 +158,11 @@ async def predict(request: Request):
 
     t0 = time.perf_counter()
     x = preprocess(raw)                                   # 4
-    probs = state["model"].predict(x, verbose=0)[0]       # 5/6 forward pass
+    probs = state["runner"].predict(x)                    # 5/6 forward pass
     top = np.argsort(probs)[::-1][:3]                     # 7 top-3
     classes = state["classes"]
     return {
-        "model": MODEL_FILE,
+        "model": state["runner"].name,
         "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
         "top3": [
             {
